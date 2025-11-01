@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WP Markdown → Astro Frontmatter Converter</title>
+  <style>
+    :root{--bg:#f7f9fc;--card:#ffffff;--muted:#6b7280;--accent:#0f172a;}
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--accent); margin:0; padding:20px;}
+    .wrap{max-width:980px;margin:0 auto;}
+    header{display:flex;align-items:center;gap:16px;margin-bottom:18px;}
+    h1{font-size:20px;margin:0;}
+    p.lead{margin:4px 0 12px;color:var(--muted);}
+    .card{background:var(--card);border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(12,15,20,0.06);margin-bottom:12px;}
+    .controls{display:flex;gap:8px;flex-wrap:wrap;}
+    .btn{background:#111827;color:#fff;padding:8px 12px;border-radius:8px;border:none;cursor:pointer;}
+    input[type=file]{display:inline-block;}
+    .file-list{margin-top:12px;}
+    .file-row{display:flex;align-items:center;justify-content:space-between;padding:10px;border-radius:8px;background:#f3f6fb;margin-bottom:8px;}
+    .file-row .meta{display:flex;gap:12px;align-items:center;}
+    .small{font-size:13px;color:var(--muted);}
+    textarea{width:100%;height:360px;margin-top:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;padding:12px;border-radius:8px;border:1px solid #e6edf7;background:#fbfdff;resize:vertical;}
+    .actions{display:flex;gap:8px;margin-top:8px;}
+    .green{background:#10b981;}
+    .download{background:#2563eb;}
+    .hint{font-size:13px;color:var(--muted);margin-top:8px;}
+    .previewTitle{font-weight:600;margin:8px 0 4px;}
+    footer{margin-top:18px;font-size:13px;color:var(--muted);}
+    @media (max-width:600px){ .controls{flex-direction:column;align-items:flex-start;} }
+  </style>
+  <!-- JSZip from CDN used to produce a single ZIP of outputs -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>WP → Astro Markdown Converter (bulk)</h1>
+        <p class="lead">Upload WordPress-exported Markdown files and convert their frontmatter to Astro-style frontmatter.</p>
+      </div>
+    </header>
+
+    <div class="card">
+      <div class="controls">
+        <input id="files" type="file" accept=".md,.markdown,text/markdown" multiple />
+        <button id="convertBtn" class="btn">Convert uploaded files</button>
+        <button id="downloadAllBtn" class="btn download" title="Download all converted files as ZIP">Download All (ZIP)</button>
+        <button id="clearBtn" class="btn" title="Clear everything">Clear</button>
+      </div>
+      <p class="hint">Simple rules used by the converter (keeps things predictable):</p>
+      <ul class="small">
+        <li>title → kept as-is.</li>
+        <li>date → converted to `YYYY-MM-DD` (keeps timezone if not present).</li>
+        <li>author (if an email like author@domain) → will use the part before `@` as authors[0].</li>
+        <li>categories and tags arrays are preserved when present.</li>
+        <li>Removes WP-only fields (id, guid, permalink, layout, original_link, unknown nested maps).</li>
+        <li>If no description found, meta_title will match title and description left blank.</li>
+      </ul>
+    </div>
+
+    <div id="results" class="file-list"></div>
+
+    <div class="card">
+      <div class="previewTitle">Preview / Manual paste</div>
+      <textarea id="manualInput" placeholder="Paste a single markdown file here (optional)"></textarea>
+      <div class="actions">
+        <button id="convertSingleBtn" class="btn">Convert pasted file</button>
+        <a id="downloadSingle" class="btn download" href="#" style="display:none" download="converted.md">Download Converted</a>
+      </div>
+      <div id="singlePreview" style="margin-top:12px"></div>
+    </div>
+
+    <footer>
+      <strong>How to use — easy steps:</strong>
+      <ol>
+        <li>Click "Choose files" and select many `.md` files exported by WordPress (the ones that start with `---`).</li>
+        <li>Click "Convert uploaded files". The app will show each converted file. You can preview and download each one.</li>
+        <li>Click "Download All (ZIP)" to get every converted file in one zip archive.</li>
+      </ol>
+      <p class="small">If something looks wrong on a particular file, open it with a text editor and paste its full contents into the box above, then click "Convert pasted file".</p>
+    </footer>
+  </div>
+
+<script>
+/*
+  Basic YAML frontmatter parser for simple WP-exported markdown frontmatter.
+  Handles:
+   - simple key: value (with or without quotes)
+   - arrays represented by lines prefixed with '- '
+   - dates and simple strings
+  Does not attempt to parse complex nested YAML blocks - those are ignored.
+*/
+
+function parseFrontmatter(text){
+  const fmMatch = text.match(/^---\s*([\s\S]*?)\s*---\s*/);
+  if(!fmMatch) return {frontmatter:null,content:text};
+  const fmRaw = fmMatch[1];
+  const rest = text.slice(fmMatch[0].length);
+  const lines = fmRaw.split(/\r?\n/);
+  const data = {};
+  let currentArrayKey = null;
+
+  for(let raw of lines){
+    const line = raw.replace(/\t/g,'    ');
+    if(/^\s*#/.test(line) || /^\s*$/.test(line)) continue;
+    // array item
+    const arrItem = line.match(/^\s*-\s+(.*)$/);
+    if(arrItem && currentArrayKey){
+      data[currentArrayKey].push(parseValue(arrItem[1]));
+      continue;
+    }
+    // key: value
+    const kv = line.match(/^\s*([A-Za-z0-9_\-@\.]+)\s*:\s*(.*)$/);
+    if(kv){
+      const key = kv[1].trim();
+      let val = kv[2].trim();
+      // if value is empty and next lines might be array, prepare an array
+      if(val === '' && lines.length>0){
+        // if next non-empty line starts with '- ' treat as array
+        currentArrayKey = key;
+        data[key] = [];
+        continue;
+      }
+      currentArrayKey = null;
+      // if value is YAML-style array like [a, b]
+      if(val.startsWith('[') && val.endsWith(']')){
+        const inner = val.slice(1,-1).trim();
+        if(inner==='') data[key] = [];
+        else {
+          data[key] = inner.split(',').map(s=>parseValue(s.trim()));
+        }
+      } else {
+        data[key] = parseValue(val);
+      }
+    } else {
+      // unrecognized line -- ignore (keeps parser simple)
+      currentArrayKey = null;
+    }
+  }
+  return {frontmatter:data, content:rest};
+}
+
+function parseValue(v){
+  if(v===undefined || v===null) return '';
+  // remove surrounding quotes if present
+  const m = v.match(/^'(.*)'$/) || v.match(/^"(.*)"$/);
+  if(m) v = m[1];
+  // booleans?
+  if(v === 'true') return true;
+  if(v === 'false') return false;
+  // numeric?
+  if(!isNaN(v) && v !== '') return Number(v);
+  return v;
+}
+
+function toYYYYMMDD(dateStr){
+  if(!dateStr) return '';
+  // try to parse using Date
+  const d = new Date(dateStr);
+  if(!isNaN(d)) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth()+1).padStart(2,'0');
+    const dd = String(d.getDate()).padStart(2,'0');
+    return `${y}-${m}-${dd}`;
+  }
+  // fallback: try strip time and timezone leaving first 10 chars
+  return dateStr.slice(0,10);
+}
+
+function buildAstroFrontmatter(obj){
+  // mapping rules:
+  // title -> title
+  // meta_title -> try meta_title or title
+  // description -> try description or excerpt or empty
+  // date -> formatted YYYY-MM-DD (from date)
+  // image -> keep image if present else blank
+  // authors -> array from author (email -> before @) or authors field if present
+  // categories -> array when present
+  // tags -> array when present (also check 'tags' or 'tag' or 'categories' fallback)
+  const out = {};
+  out.title = obj.title || obj['title'] || '';
+  out.meta_title = obj.meta_title || out.title;
+  out.description = obj.description || obj.excerpt || '';
+  out.date = toYYYYMMDD(obj.date || obj['date'] || '');
+  out.image = obj.image || '';
+  // authors: WordPress export often includes 'author' or 'author_name' or 'author: admin@domain.com'
+  let authors = [];
+  if(obj.authors && Array.isArray(obj.authors)) authors = obj.authors;
+  else if(obj.author){
+    let a = obj.author;
+    if(typeof a === 'string' && a.includes('@')) a = a.split('@')[0];
+    authors = [a];
+  } else if(obj.author_name) authors = [obj.author_name];
+  out.authors = authors;
+
+  // categories may be in different formats; try to collect useful ones
+  let categories = [];
+  if(Array.isArray(obj.categories)) categories = obj.categories;
+  else if(obj.category) categories = [obj.category];
+  else if(obj.Categories) categories = obj.Categories;
+  out.categories = categories;
+
+  // tags: WordPress may export 'tags' or 'tag' or none
+  let tags = [];
+  if(Array.isArray(obj.tags)) tags = obj.tags;
+  else if(obj.tag) tags = [obj.tag];
+  out.tags = tags;
+
+  return out;
+}
+
+function frontmatterToString(fm){
+  // build YAML frontmatter string exactly in the order user wanted:
+  // title, meta_title, description, date, image, authors, categories, tags
+  const lines = [];
+  lines.push('---');
+  lines.push(`title: "${escapeYaml(fm.title)}"`);
+  lines.push(`meta_title: "${escapeYaml(fm.meta_title)}"`);
+  lines.push(`description: "${escapeYaml(fm.description)}"`);
+  lines.push(`date: ${fm.date ? fm.date : ''}`);
+  lines.push(`image: "${escapeYaml(fm.image)}"`);
+  // authors array
+  if(Array.isArray(fm.authors) && fm.authors.length){
+    lines.push('authors: [' + fm.authors.map(a=>`"${escapeYaml(a)}"`).join(', ') + ']');
+  } else {
+    lines.push('authors: []');
+  }
+  // categories
+  if(Array.isArray(fm.categories) && fm.categories.length){
+    lines.push('categories: [' + fm.categories.map(c=>`"${escapeYaml(c)}"`).join(', ') + ']');
+  } else {
+    lines.push('categories: []');
+  }
+  // tags
+  if(Array.isArray(fm.tags) && fm.tags.length){
+    lines.push('tags: [' + fm.tags.map(t=>`"${escapeYaml(t)}"`).join(', ') + ']');
+  } else {
+    lines.push('tags: []');
+  }
+  lines.push('---\n');
+  return lines.join('\n');
+}
+
+function escapeYaml(s){
+  if(s===null||s===undefined) return '';
+  return String(s).replace(/"/g,'\\"');
+}
+
+// Convert a file's text content and return converted markdown as string
+function convertMarkdownText(text){
+  const parsed = parseFrontmatter(text);
+  const src = parsed.frontmatter || {};
+  const content = parsed.content || '';
+  const astro = buildAstroFrontmatter(src);
+  const fmStr = frontmatterToString(astro);
+  // Ensure a blank line after frontmatter (already added)
+  return fmStr + (content.startsWith('\n') ? content.slice(1) : content);
+}
+
+// UI wiring
+const filesInput = document.getElementById('files');
+const results = document.getElementById('results');
+const convertBtn = document.getElementById('convertBtn');
+const downloadAllBtn = document.getElementById('downloadAllBtn');
+const clearBtn = document.getElementById('clearBtn');
+
+let convertedFiles = []; // {name, text}
+
+convertBtn.addEventListener('click', async ()=>{
+  const fileList = filesInput.files;
+  if(!fileList || fileList.length===0){
+    alert('Select one or more markdown files first.');
+    return;
+  }
+  results.innerHTML = '';
+  convertedFiles = [];
+  for(const f of fileList){
+    try {
+      const txt = await f.text();
+      const converted = convertMarkdownText(txt);
+      const outName = f.name.replace(/\.md|\.markdown/i,'') + '-converted.md';
+      convertedFiles.push({name:outName, text:converted});
+      addResultRow(outName, converted);
+    } catch(e){
+      console.error('file read error',e);
+    }
+  }
+  alert('Conversion finished. Scroll down to preview or download.');
+});
+
+function addResultRow(name, text){
+  const div = document.createElement('div');
+  div.className = 'file-row';
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const title = document.createElement('div');
+  title.innerHTML = `<strong>${escapeHtml(name)}</strong><div class="small">size: ${formatSize(text.length)} • converted</div>`;
+  meta.appendChild(title);
+  const actions = document.createElement('div');
+  actions.style.display='flex';
+  actions.style.gap='8px';
+  const previewBtn = document.createElement('button');
+  previewBtn.className='btn';
+  previewBtn.textContent='Preview';
+  previewBtn.onclick = ()=> showPreview(name, text);
+  const downloadBtn = document.createElement('a');
+  downloadBtn.className='btn download';
+  downloadBtn.textContent='Download';
+  downloadBtn.href = URL.createObjectURL(new Blob([text],{type:'text/markdown'}));
+  downloadBtn.download = name;
+  actions.appendChild(previewBtn);
+  actions.appendChild(downloadBtn);
+  div.appendChild(meta);
+  div.appendChild(actions);
+  results.appendChild(div);
+}
+
+function showPreview(name, text){
+  const w = window.open('','_blank','width=800,height=700');
+  w.document.write('<pre style="white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;padding:12px;">'+escapeHtml(text)+'</pre>');
+  w.document.title = name;
+}
+
+function escapeHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatSize(n){
+  if(n<1024) return n+' B';
+  if(n<1024*1024) return Math.round(n/1024)+' KB';
+  return Math.round(n/(1024*1024))+' MB';
+}
+
+// Download all as ZIP using JSZip
+downloadAllBtn.addEventListener('click', async ()=>{
+  if(convertedFiles.length===0){
+    alert('No converted files. Convert files first.');
+    return;
+  }
+  const zip = new JSZip();
+  for(const f of convertedFiles){
+    zip.file(f.name, f.text);
+  }
+  const content = await zip.generateAsync({type:'blob'});
+  const url = URL.createObjectURL(content);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'converted-markdown.zip';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+
+// Clear
+clearBtn.addEventListener('click', ()=>{
+  filesInput.value = '';
+  results.innerHTML = '';
+  convertedFiles = [];
+  document.getElementById('manualInput').value = '';
+  document.getElementById('downloadSingle').style.display='none';
+  document.getElementById('singlePreview').innerHTML = '';
+});
+
+// manual paste converter (single)
+document.getElementById('convertSingleBtn').addEventListener('click', ()=>{
+  const txt = document.getElementById('manualInput').value;
+  if(!txt) { alert('Paste a markdown file into the box first.'); return; }
+  const conv = convertMarkdownText(txt);
+  document.getElementById('singlePreview').innerHTML = '<pre style="white-space:pre-wrap;font-family:ui-monospace,monospace;padding:12px;background:#fbfdff;border-radius:8px;border:1px solid #eef6ff;">'+escapeHtml(conv)+'</pre>';
+  const blob = new Blob([conv],{type:'text/markdown'});
+  const url = URL.createObjectURL(blob);
+  const dl = document.getElementById('downloadSingle');
+  dl.href = url;
+  dl.style.display='inline-block';
+  dl.download = 'converted.md';
+});
+
+// auto-convert when user drops files (optional)
+filesInput.addEventListener('change', () => {
+  // do nothing auto — user must click Convert
+});
+
+</script>
+</body>
+</html>
